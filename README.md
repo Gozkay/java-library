@@ -1,61 +1,71 @@
 # Console Library Management System
 
-Java 17+ / Maven / Gson command-line library. No GUI, no database: all data lives in JSON files in `data/`.
+A Java 17+ command-line library system built with Maven and Gson. It has no GUI or database; the application stores its data in JSON files under `data/`.
 
-> **Status:** storage layer, models, seed data, exceptions and project scaffold are done (Gozie).
-> Services, policies, events, CLI and reports are in progress by the rest of the team. See `docs/REPOSITORY_CONTRACT.md`.
+## Build and run
 
-## Build, test, run
-```bash
-mvn test                  # runs the storage / persistence tests
-mvn compile exec:java     # runs com.library.Main (creates data/ on first run)
-mvn package && java -jar target/console-library-system-1.0.0.jar
+Install a JDK 17+ and Maven, then run:
+
+```shell
+mvn clean test
+mvn package
+java -jar target/console-library-system-1.0.0.jar
 ```
-Use another data folder with `-Dlibrary.data.dir=/path/to/data`.
 
-## First run and default logins
-On first run `data/` is created and seeded with 22 items (9 books, 5 magazines, 4 DVDs, 4 reference books) and 6 accounts.
+The shaded executable JAR includes Gson. To run from Maven during development:
+
+```shell
+mvn exec:java
+```
+
+Use an isolated data directory with `-Dlibrary.data.dir=<path>`. For example:
+
+```shell
+java -Dlibrary.data.dir=demo-data -jar target/console-library-system-1.0.0.jar
+```
+
+`library.clock.fixed` can override the clock with an ISO-8601 instant for repeatable demos and tests. Do not use a fixed clock for normal operation:
+
+```shell
+java -Dlibrary.data.dir=demo-data -Dlibrary.clock.fixed=2026-11-01T10:00:00Z -jar target/console-library-system-1.0.0.jar
+```
+
+## First run
+
+The first launch seeds 22 items across all four types, five members, and a librarian account. The sample credentials are for local demonstration only.
 
 | User ID | Password | Role |
-|---|---|---|
-| `admin` | `admin123` | LIBRARIAN |
-| `M-1`, `M-2` | `pass123` | MEMBER (STUDENT) |
-| `M-3`, `M-4` | `pass123` | MEMBER (STAFF) |
-| `M-5` | `pass123` | MEMBER (SENIOR) |
+| --- | --- | --- |
+| `admin` | `admin123` | Librarian |
+| `M-1`, `M-2` | `pass123` | Student |
+| `M-3`, `M-4` | `pass123` | Staff |
+| `M-5` | `pass123` | Senior |
 
-Passwords are stored as SHA-256 with a per-user random salt, never in plain text.
+Passwords are stored as per-user salted PBKDF2-HMAC-SHA256 hashes, never as plaintext. For production use, replace the sample credentials and tune the password-hashing parameters to your deployment's security requirements.
 
-## Project layout
-```
-com.library
-  model/       Item, Book, Magazine, DVD, ReferenceBook, Copy, User, Member, Loan, Reservation, Fine, Notification + enums
-  service/     (Sommy, Chioma, Justina)     policy/ (Chioma)     event/ (Sommy)     cli/ (Justina)
-  repository/  interfaces, DataContext, SeedDataLoader
-    json/      Gson + file-based implementations
-    memory/    in-memory implementations (week-1 work and tests)
-  factory/     ItemFactory (+ MembershipPolicyFactory, Chioma)
-  exception/   custom exceptions (all extend LibraryException)
-  util/        IdGenerator, PasswordHasher, AtomicFileWriter
-```
+## Commands
 
-## Data storage design decisions
-- **One file per collection** in `data/`: `users.json`, `items.json`, `loans.json`, `reservations.json`, `fines.json`, `notifications.json`
-  (plus `activity.log`, written by the ActivityLog listener).
-- **Repository pattern:** services use interfaces only. `DataContext` is the single place that chooses JSON or in-memory.
-- **Load at startup, save after every change.** Data is cached in memory; each `save` rewrites that collection's file.
-- **Crash-safe saving:** content goes to a temporary file in the same folder, is flushed to disk, then atomically moved over the real
-  file (`AtomicFileWriter`). Stale `.tmp` files left by a crash are removed at startup.
-- **Missing file:** created empty. **Corrupt file** (bad JSON, empty file, unknown type, bad date, duplicate ID): start-up stops with a
-  clear message and exit code 1, and the file is left untouched.
-- **Polymorphic loading:** items store a `type` (BOOK, MAGAZINE, DVD, REFERENCE_BOOK) and users a `role`. A Gson adapter asks
-  `ItemFactory` which subclass to rebuild, so `Book`, `ReferenceBook` and the rest come back as the right class.
-- **Money** is `BigDecimal` written as a JSON string (`"200.00"`). **Dates** are ISO-8601 strings (`"2026-10-29"`).
-- **IDs** (`I-12`, `M-3`, `L-31`, `R-7`, `F-9`) continue after a restart: counters move past the highest ID found on disk.
-  Copy IDs are derived from the item (`I-12-C2`).
-- **Thread safety:** repository methods are synchronized and the ID generator is atomic. Locking a whole multi-step borrow/return is the job of `LoanService`.
+Run `help` after login to see commands for the current role.
 
-## Command list
-_To be completed by Justina when the CLI is wired in (brief section 4.8)._
+**General:** `login <userId> <password>`, `logout`, `whoami`, `search [text] [--author=...] [--category=...] [--type=BOOK|MAGAZINE|DVD|REFERENCE_BOOK] [--available]`, `help`, `exit`.
 
-## UML diagram
-_To be added by Justina with contributions from everyone._
+**Members:** `borrow <itemId>`, `return <copyId>`, `renew <loanId>`, `reserve <itemId>`, `collect <reservationId>`, `cancel <reservationId>`, `my loans`, `my history`, `my reservations`, `my fines`, `inbox`.
+
+**Librarians:** `item add <type> "<title>" [--category=...] [--year=...] [--copies=...]` (also `--author`, `--isbn`, `--publisher`, `--pages`, `--issue`, `--month`, `--director`, `--runtime` as appropriate); `item edit <itemId> [--title=...] [--category=...] [--year=...]`; `item info <itemId>`; `item retire <itemId>`; `copy add <itemId> <count>`; `member add "<name>" <STUDENT|STAFF|SENIOR> [password]`; `member list`; `member suspend|activate <memberId>`; `member unlock <userId>`; `borrow <memberId> <itemId>`; `return <copyId>`; `renew <loanId>`; `lost <loanId>`; `reserve <memberId> <itemId>`; `cancel <reservationId>`; `fines <memberId>`; `fine pay <fineId> <amount>`; `report overdue`; `report popular [N] [--from=YYYY-MM-DD] [--to=YYYY-MM-DD]`; `report unpaid`; `report unused`; `report member <memberId>`; `report summary`.
+
+Quoted arguments preserve spaces in names and titles. Invalid commands and business-rule violations are reported without terminating the interactive session.
+
+## Design and data
+
+- **Models and policies:** item inheritance (`Book`, `Magazine`, `DVD`, `ReferenceBook`) and membership strategies (`StudentPolicy`, `StaffPolicy`, `SeniorPolicy`) define loan terms.
+- **Services and repositories:** the CLI delegates application operations to services; services use repository interfaces. JSON and in-memory repositories share the same interfaces.
+- **Factories:** `ItemFactory` and `MembershipPolicyFactory` reconstruct and create domain types.
+- **Fine strategy:** `DailyRateFineStrategy` calculates overdue amounts using a member's policy and `BigDecimal`. Lost items use a fixed replacement fee of 1000.00.
+- **Events:** `EventBus` publishes events to `NotificationInbox` and `ActivityLog` observers. `data/activity.log` is append-only.
+- **Persistence:** each JSON collection is loaded on startup and saved after changes using a temporary file and atomic replacement. Missing files are initialized; corrupt files stop startup with an error.
+- **Dates and concurrency:** services receive an injected `Clock`; multi-step loan operations are synchronized.
+- **IDs:** generated IDs advance past existing records on restart.
+
+The JSON files are `users.json`, `items.json`, `loans.json`, `reservations.json`, `fines.json`, and `notifications.json`. The `data/` directory is ignored by Git so local library data is not submitted.
+
+See [the class diagram](docs/CLASS_DIAGRAM.md), [the demo plan](docs/DEMO_PLAN.md), and the [repository contract](docs/REPOSITORY_CONTRACT.md).

@@ -7,4 +7,5 @@ public interface ReservationServiceApi {
     Reservation placeReservation(String memberId, String itemId);
     void cancelReservation(String reservationId, String actorUserId);
     List<Reservation> getMemberReservations(String memberId);
+    void expireReservations();
 }

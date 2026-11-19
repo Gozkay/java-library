@@ -4,10 +4,10 @@ package com.library.service;
 import com.library.factory.MembershipPolicyFactory;
 import com.library.model.Fine;
 import com.library.model.FineReason;
-import com.library.model.FineStatus;
 import com.library.model.Loan;
 import com.library.model.Member;
-import com.library.policy.MembershipPolicy;
+import com.library.policy.DailyRateFineStrategy;
+import com.library.policy.FineStrategy;
 import com.library.repository.FineRepository;
 import com.library.repository.LoanRepository;
 import com.library.util.IdGenerator;
@@ -20,25 +20,27 @@ import java.time.temporal.ChronoUnit;
 import java.util.List;
 import java.util.Objects;
 
-public class FineService {
+public class FineService implements FineServiceApi {
 
     private final FineRepository fines;
-    private final LoanRepository loans;
     private final IdGenerator ids;
     private final Clock clock;
-    private final MembershipPolicyFactory policyFactory;
+    private final FineStrategy fineStrategy;
 
     public FineService(
             FineRepository fines,
-            LoanRepository loans,
             IdGenerator ids,
             Clock clock
     ) {
         this.fines = Objects.requireNonNull(fines);
-        this.loans = Objects.requireNonNull(loans);
         this.ids = Objects.requireNonNull(ids);
         this.clock = Objects.requireNonNull(clock);
-        this.policyFactory = new MembershipPolicyFactory();
+        this.fineStrategy = new DailyRateFineStrategy(new MembershipPolicyFactory());
+    }
+
+    public FineService(FineRepository fines, LoanRepository loans, IdGenerator ids, Clock clock) {
+        this(fines, ids, clock);
+        Objects.requireNonNull(loans, "loans repository required");
     }
 
     /**
@@ -62,12 +64,7 @@ public class FineService {
                 today
         );
 
-        MembershipPolicy policy = policyFactory.createPolicy(
-                member.getMembershipType()
-        );
-
-        return policy.getDailyFineRate()
-                .multiply(BigDecimal.valueOf(overdueDays));
+        return fineStrategy.calculate(overdueDays, member);
     }
 
     /**
@@ -154,11 +151,33 @@ public class FineService {
         return fine;
     }
 
+    @Override
+    public Fine payFine(String fineId, BigDecimal amount) {
+        Objects.requireNonNull(amount, "payment amount required");
+        if (amount.signum() <= 0) {
+            throw new IllegalArgumentException("Payment amount must be greater than zero.");
+        }
+        Fine fine = fines.findById(fineId)
+                .orElseThrow(() -> new IllegalArgumentException("Fine not found: " + fineId));
+        if (!fine.isUnpaid()) {
+            throw new IllegalStateException("This fine has already been paid.");
+        }
+        if (fine.getAmount().compareTo(amount) != 0) {
+            throw new IllegalArgumentException("Payment must equal the full fine amount of " + fine.getAmount() + ".");
+        }
+        return payFine(fineId);
+    }
+
     /**
      * Retrieves all fines belonging to a member.
      */
     public List<Fine> getMemberFines(String memberId) {
         return fines.findByMemberId(memberId);
+    }
+
+    @Override
+    public BigDecimal getUnpaidTotal(String memberId) {
+        return getTotalUnpaidAmount(memberId);
     }
 
     /**
