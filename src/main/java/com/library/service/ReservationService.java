@@ -10,6 +10,7 @@ import com.library.model.Member;
 import com.library.model.Reservation;
 import com.library.model.ReservationStatus;
 import com.library.repository.ItemRepository;
+import com.library.repository.LoanRepository;
 import com.library.repository.ReservationRepository;
 import com.library.repository.UserRepository;
 import com.library.util.IdGenerator;
@@ -21,12 +22,13 @@ import java.time.LocalDateTime;
 import java.util.List;
 import java.util.Objects;
 
-public class ReservationService {
+public class ReservationService implements ReservationServiceApi {
 
     private static final int HOLD_PERIOD_DAYS = 3;
 
     private final ReservationRepository reservations;
     private final ItemRepository items;
+    private final LoanRepository loans;
     private final UserRepository users;
     private final IdGenerator ids;
     private final Clock clock;
@@ -40,8 +42,21 @@ public class ReservationService {
             Clock clock,
             EventBus eventBus
     ) {
+        this(reservations, items, null, users, ids, clock, eventBus);
+    }
+
+    public ReservationService(
+            ReservationRepository reservations,
+            ItemRepository items,
+            LoanRepository loans,
+            UserRepository users,
+            IdGenerator ids,
+            Clock clock,
+            EventBus eventBus
+    ) {
         this.reservations = Objects.requireNonNull(reservations);
         this.items = Objects.requireNonNull(items);
+        this.loans = loans;
         this.users = Objects.requireNonNull(users);
         this.ids = Objects.requireNonNull(ids);
         this.clock = Objects.requireNonNull(clock);
@@ -51,6 +66,11 @@ public class ReservationService {
     /**
      * Adds a member to an item's reservation queue.
      */
+    @Override
+    public synchronized Reservation placeReservation(String memberId, String itemId) {
+        return reserveItem(memberId, itemId);
+    }
+
     public synchronized Reservation reserveItem(
             String memberId,
             String itemId
@@ -62,7 +82,7 @@ public class ReservationService {
                         )
                 );
 
-        if (!member.isActive()) {
+        if (!member.isActive() || member.isLocked()) {
             throw new IllegalStateException(
                     "Suspended members cannot make reservations."
             );
@@ -92,6 +112,13 @@ public class ReservationService {
             );
         }
 
+        boolean alreadyBorrowed = loans != null
+                && loans.findActiveByMemberId(memberId).stream()
+                .anyMatch(loan -> loan.getItemId().equals(itemId));
+        if (alreadyBorrowed) {
+            throw new IllegalStateException("A member cannot reserve an item they have already collected.");
+        }
+
         if (item.findAvailableCopy().isPresent()) {
             throw new IllegalStateException(
                     "A copy is currently available. Borrow it instead."
@@ -110,9 +137,7 @@ public class ReservationService {
         return reservation;
     }
 
-    /**
-     * Assigns an available copy to the first waiting member.
-     */
+    /** Marks a returned or released copy as held for the first waiting member. */
     public synchronized Reservation makeNextReservationReady(
             String itemId,
             String copyId
@@ -131,10 +156,9 @@ public class ReservationService {
                         )
                 );
 
-        if (copy.getStatus() != CopyStatus.AVAILABLE) {
-            throw new IllegalStateException(
-                    "The copy is not available for reservation."
-            );
+        if (copy.getStatus() != CopyStatus.ON_LOAN
+                && copy.getStatus() != CopyStatus.ON_HOLD) {
+            throw new IllegalStateException("The copy cannot be placed on hold from " + copy.getStatus() + ".");
         }
 
         List<Reservation> queue =
@@ -157,7 +181,9 @@ public class ReservationService {
                 today.plusDays(HOLD_PERIOD_DAYS)
         );
 
-        copy.moveTo(CopyStatus.ON_HOLD);
+        if (copy.getStatus() != CopyStatus.ON_HOLD) {
+            copy.moveTo(CopyStatus.ON_HOLD);
+        }
 
         reservations.save(next);
         items.save(item);
@@ -172,63 +198,12 @@ public class ReservationService {
     }
 
     /**
-     * Marks a ready reservation as collected.
-     *
-     * The calling workflow must create the corresponding loan record.
-     */
-    public synchronized Reservation collectReservation(
-            String reservationId
-    ) {
-        Reservation reservation = reservations.findById(reservationId)
-                .orElseThrow(() ->
-                        new IllegalArgumentException(
-                                "Reservation not found: " + reservationId
-                        )
-                );
-
-        if (reservation.getStatus() != ReservationStatus.READY) {
-            throw new IllegalStateException(
-                    "This reservation is not ready for collection."
-            );
-        }
-
-        LocalDate today = LocalDate.now(clock);
-
-        if (today.isAfter(reservation.getHoldExpiresOn())) {
-            expireReservations();
-
-            throw new IllegalStateException(
-                    "The reservation has expired."
-            );
-        }
-
-        Item item = items.findById(reservation.getItemId())
-                .orElseThrow(() ->
-                        new IllegalArgumentException(
-                                "Item not found: " + reservation.getItemId()
-                        )
-                );
-
-        Copy copy = item.findCopy(reservation.getCopyId())
-                .orElseThrow(() ->
-                        new IllegalStateException(
-                                "The reserved copy could not be found."
-                        )
-                );
-
-        reservation.setStatus(ReservationStatus.COLLECTED);
-
-        reservations.save(reservation);
-
-        return reservation;
-    }
-
-    /**
      * Cancels a member's active reservation.
      */
+    @Override
     public synchronized void cancelReservation(
             String reservationId,
-            String memberId
+            String actorUserId
     ) {
         Reservation reservation = reservations.findById(reservationId)
                 .orElseThrow(() ->
@@ -237,7 +212,10 @@ public class ReservationService {
                         )
                 );
 
-        if (!reservation.getMemberId().equals(memberId)) {
+        var actor = users.findById(actorUserId)
+                .orElseThrow(() -> new IllegalArgumentException("Account not found: " + actorUserId));
+        if (actor.getRole() != com.library.model.Role.LIBRARIAN
+                && !reservation.getMemberId().equals(actorUserId)) {
             throw new IllegalStateException(
                     "You cannot cancel another member's reservation."
             );
@@ -267,13 +245,14 @@ public class ReservationService {
                             )
                     );
 
-            copy.moveTo(CopyStatus.AVAILABLE);
-            items.save(item);
-
-            makeNextReservationReady(
-                    reservation.getItemId(),
-                    copy.getCopyId()
-            );
+            boolean nextWaiting = reservations.findActiveQueueForItem(reservation.getItemId()).stream()
+                    .anyMatch(r -> r.getStatus() == ReservationStatus.WAITING);
+            if (nextWaiting) {
+                makeNextReservationReady(reservation.getItemId(), copy.getCopyId());
+            } else {
+                copy.moveTo(CopyStatus.AVAILABLE);
+                items.save(item);
+            }
         }
     }
 
@@ -318,14 +297,19 @@ public class ReservationService {
                                 )
                         );
 
-                copy.moveTo(CopyStatus.AVAILABLE);
-                items.save(item);
-
-                makeNextReservationReady(itemId, copyId);
+                boolean nextWaiting = reservations.findActiveQueueForItem(itemId).stream()
+                        .anyMatch(r -> r.getStatus() == ReservationStatus.WAITING);
+                if (nextWaiting) {
+                    makeNextReservationReady(itemId, copyId);
+                } else {
+                    copy.moveTo(CopyStatus.AVAILABLE);
+                    items.save(item);
+                }
             }
         }
     }
 
+    @Override
     public List<Reservation> getMemberReservations(
             String memberId
     ) {

@@ -1,7 +1,6 @@
-# Storage contract (Gozie): what Chioma, Sommy and Justina code against
+# Repository and storage contract
 
-Everything below is implemented and tested. **Services depend only on the interfaces in `com.library.repository`.**
-Get them from one place:
+**Services depend on the interfaces in `com.library.repository`.** `DataContext` is the composition point for JSON-backed application storage and in-memory test storage:
 
 ```java
 DataContext ctx = DataContext.json(Path.of("data"));  // real app (Main does this)
@@ -18,8 +17,7 @@ ctx.users()  ctx.items()  ctx.loans()  ctx.reservations()  ctx.fines()  ctx.noti
 3. **IDs:** `ctx.ids().next(Kind.LOAN)` gives `L-1, L-2, ...` and continues after a restart. Kinds: ITEM, MEMBER, LOAN, RESERVATION, FINE, NOTIFICATION.
    Copy IDs are built by the item itself (`I-3-C2`). Do not invent IDs yourself.
 4. **Never call `LocalDate.now()`** in a service. Inject a `Clock` (`Main` creates it).
-5. **Thread safety:** each repository method is synchronized, but a borrow is several steps (check copy, move copy, save loan).
-   Sommy: wrap the whole borrow/return in one `synchronized` block or `ReentrantLock` inside LoanService.
+5. **Thread safety:** repository methods are synchronized, and the composed `LoanService` synchronizes each multi-step borrow, return, renew, lost-item, and collection operation.
 6. Files are written one at a time, so a crash *between* two saves is possible. Save the **item first, then the loan**,
    so a crash can never leave a loan pointing at a copy that was never marked ON_LOAN.
 
@@ -35,10 +33,10 @@ All repositories have: `save(e)`, `saveAll(list)`, `findById(id)` (Optional), `f
 | `FineRepository` | `findByMemberId`, `findUnpaid()`, `findUnpaidByMemberId`, `findByLoanId` |
 | `NotificationRepository` | `findByMemberId` (oldest first), `findUnreadByMemberId` |
 
-Need another query? Add a `default` method to the interface (it then works for both JSON and in-memory) and tell Gozie.
-`activity.log` is **not** a repository: Sommy's `ActivityLog` listener just appends lines to `data/activity.log`.
+Need another query? Add a `default` method to the interface so it works for both JSON and in-memory repositories.
+`activity.log` is **not** a repository: the `ActivityLog` observer appends events to `data/activity.log`.
 
-## Model fields (shared; Chioma owns the classes, change them together)
+## Model fields
 | Class | Fields |
 |---|---|
 | `Item` (abstract) | itemId, **type** (ItemType), title, category, publicationYear, retired, copies |
@@ -57,10 +55,8 @@ Need another query? Add a `default` method to the interface (it then works for b
 **Adding an Item subclass:** add its value to `ItemType` and its class to `ItemFactory.classFor(...)`, otherwise loading fails with a "corrupt" message.
 Keep a private no-argument constructor in every model class (Gson uses it, so field initialisers run).
 
-## Things Gozie drafted that belong to someone else
-- `ItemFactory.classFor` (Chioma adds `create(...)`), `PasswordHasher` (Justina may harden it, keeping the same 3 signatures), the model classes and enums.
-- `Item.retire()` and `CopyStatus.canMoveTo` follow brief section 4.11. Chioma / Sommy: say so if you want them different.
+`Item.retire()` and `CopyStatus.canMoveTo` enforce the item and copy lifecycle rules in the project brief.
 
-## Open decision for the group
-- Seeded logins are `admin / admin123` and `M-1..M-5 / pass123`. `member add` (Justina / Sommy) must choose an initial password
-  for new members (suggestion: the librarian types it, or it defaults to the member ID).
+## Initial accounts
+
+The sample accounts are `admin / admin123` and `M-1..M-5 / pass123`. When the librarian registers a member without specifying an initial password, the new member's ID is used as the initial password.

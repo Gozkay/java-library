@@ -7,6 +7,8 @@ import com.library.model.Item;
 import com.library.model.Loan;
 import com.library.model.Member;
 import com.library.model.MembershipType;
+import com.library.factory.MembershipPolicyFactory;
+import com.library.policy.MembershipPolicy;
 import com.library.repository.DataContext;
 import com.library.repository.FineRepository;
 import com.library.repository.ItemRepository;
@@ -57,7 +59,8 @@ public class ReportService {
             String itemTitle,
             String copyId,
             LocalDate dueDate,
-            long daysOverdue
+            long daysOverdue,
+            BigDecimal fineSoFar
     ) { }
 
     public record PopularItemEntry(
@@ -96,32 +99,43 @@ public class ReportService {
             BigDecimal totalCollectedFines
     ) { }
 
+    public record UnpaidFineEntry(String memberId, String memberName, BigDecimal amount) { }
+
     public List<OverdueEntry> getOverdueLoans() {
         LocalDate today = LocalDate.now(clock);
         return loans.findActive().stream()
                 .filter(l -> l.getDueDate() != null && l.getDueDate().isBefore(today))
                 .sorted(Comparator.comparing(Loan::getDueDate))
                 .map(l -> {
-                    String memberName = users.findById(l.getMemberId())
-                            .map(u -> u.getName())
-                            .orElse("Unknown");
+                    Member member = users.findMemberById(l.getMemberId()).orElse(null);
+                    String memberName = member == null ? "Unknown" : member.getName();
                     String title = items.findById(l.getItemId())
                             .map(Item::getTitle)
                             .orElse("Unknown Item");
                     long days = ChronoUnit.DAYS.between(l.getDueDate(), today);
+                    BigDecimal fine = BigDecimal.ZERO;
+                    if (member != null) {
+                        MembershipPolicy policy = new MembershipPolicyFactory()
+                                .createPolicy(member.getMembershipType());
+                        fine = policy.getDailyFineRate().multiply(BigDecimal.valueOf(days));
+                    }
                     return new OverdueEntry(
-                            l.getLoanId(), l.getMemberId(), memberName,
-                            l.getItemId(), title, l.getCopyId(), l.getDueDate(), days
+                            l.getLoanId(), l.getMemberId(), memberName, l.getItemId(),
+                            title, l.getCopyId(), l.getDueDate(), days, fine
                     );
                 })
                 .toList();
     }
 
     public List<PopularItemEntry> getPopularItems(int topN) {
+        return getPopularItems(topN, null, null);
+    }
+
+    public List<PopularItemEntry> getPopularItems(int topN, LocalDate from, LocalDate to) {
         if (topN <= 0) {
             return List.of();
         }
-        Map<String, Long> countsByItem = loans.findAll().stream()
+        Map<String, Long> countsByItem = loans.findBorrowedBetween(from, to).stream()
                 .collect(Collectors.groupingBy(Loan::getItemId, Collectors.counting()));
 
         return countsByItem.entrySet().stream()
@@ -134,6 +148,29 @@ public class ReportService {
                     String category = item != null ? item.getCategory() : "-";
                     return new PopularItemEntry(e.getKey(), title, category, e.getValue());
                 })
+                .toList();
+    }
+
+    public List<UnpaidFineEntry> getMembersWithUnpaidFines() {
+        Map<String, BigDecimal> totals = fines.findUnpaid().stream()
+                .filter(fine -> fine.getAmount() != null)
+                .collect(Collectors.groupingBy(Fine::getMemberId,
+                        Collectors.mapping(Fine::getAmount,
+                                Collectors.reducing(BigDecimal.ZERO, BigDecimal::add))));
+        return totals.entrySet().stream()
+                .sorted(Map.Entry.comparingByKey())
+                .map(entry -> {
+                    String name = users.findMemberById(entry.getKey())
+                            .map(Member::getName).orElse("Unknown");
+                    return new UnpaidFineEntry(entry.getKey(), name, entry.getValue());
+                })
+                .toList();
+    }
+
+    public List<Item> getItemsNeverBorrowed() {
+        var borrowedIds = loans.findAll().stream().map(Loan::getItemId).collect(Collectors.toSet());
+        return items.findAll().stream()
+                .filter(item -> !item.isRetired() && !borrowedIds.contains(item.getItemId()))
                 .toList();
     }
 
@@ -214,10 +251,6 @@ public class ReportService {
 
     public static int maxLoansFor(MembershipType type) {
         if (type == null) return 3;
-        return switch (type) {
-            case STUDENT -> 5;
-            case STAFF -> 10;
-            case SENIOR -> 4;
-        };
+        return new MembershipPolicyFactory().createPolicy(type).getLoanLimit();
     }
 }

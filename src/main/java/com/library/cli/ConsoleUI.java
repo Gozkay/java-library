@@ -2,17 +2,14 @@ package com.library.cli;
 
 import com.library.cli.CommandParser.ParsedCommand;
 import com.library.exception.LibraryException;
-import com.library.model.Book;
-import com.library.model.DVD;
+import com.library.factory.ItemFactory;
 import com.library.model.Fine;
 import com.library.model.Item;
 import com.library.model.ItemType;
 import com.library.model.Loan;
-import com.library.model.Magazine;
 import com.library.model.Member;
 import com.library.model.MembershipType;
 import com.library.model.Notification;
-import com.library.model.ReferenceBook;
 import com.library.model.Reservation;
 import com.library.model.Role;
 import com.library.model.User;
@@ -21,17 +18,21 @@ import com.library.service.AuthService;
 import com.library.service.CatalogueServiceApi;
 import com.library.service.CirculationServiceApi;
 import com.library.service.FineServiceApi;
+import com.library.service.NotificationService;
+import com.library.service.NotificationServiceApi;
 import com.library.service.ReportService;
 import com.library.service.ReportService.CollectionSummary;
 import com.library.service.ReportService.MemberLoanHistoryEntry;
 import com.library.service.ReportService.OverdueEntry;
 import com.library.service.ReportService.PopularItemEntry;
 import com.library.service.ReservationServiceApi;
+import com.library.util.IdGenerator;
 
 import java.io.InputStream;
 import java.io.PrintStream;
 import java.math.BigDecimal;
 import java.time.Clock;
+import java.time.LocalDate;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -40,14 +41,14 @@ import java.util.Scanner;
 
 /**
  * Role-aware command-line interface for librarians and members.
- * Works immediately against DataContext + AuthService + ReportService and delegates
- * catalogue/circulation/reservation/fine operations cleanly once wired.
+ * Application services are injected at startup and invoked by the command handlers.
  */
 public class ConsoleUI {
-    private final DataContext ctx;
     private final AuthService authService;
     private final ReportService reportService;
     private final Clock clock;
+    private final IdGenerator ids;
+    private final NotificationServiceApi notificationService;
     private final InputStream in;
     private final PrintStream out;
 
@@ -62,7 +63,15 @@ public class ConsoleUI {
 
     public ConsoleUI(DataContext ctx, AuthService authService, ReportService reportService,
                      Clock clock, InputStream in, PrintStream out) {
-        this.ctx = Objects.requireNonNull(ctx, "DataContext required");
+        this(Objects.requireNonNull(ctx, "DataContext required").ids(),
+                new NotificationService(ctx.notifications()), authService, reportService, clock, in, out);
+    }
+
+    public ConsoleUI(IdGenerator ids, NotificationServiceApi notificationService,
+                     AuthService authService, ReportService reportService, Clock clock,
+                     InputStream in, PrintStream out) {
+        this.ids = Objects.requireNonNull(ids, "ID generator required");
+        this.notificationService = Objects.requireNonNull(notificationService, "Notification service required");
         this.authService = Objects.requireNonNull(authService, "AuthService required");
         this.reportService = Objects.requireNonNull(reportService, "ReportService required");
         this.clock = Objects.requireNonNull(clock, "Clock required");
@@ -122,6 +131,9 @@ public class ConsoleUI {
         }
 
         try {
+            if (reservationService != null) {
+                reservationService.expireReservations();
+            }
             return switch (cmd.command()) {
                 case "exit", "quit" -> false;
                 case "help" -> { printHelp(); yield true; }
@@ -130,13 +142,15 @@ public class ConsoleUI {
                 case "whoami" -> { handleWhoAmI(); yield true; }
                 case "search", "catalog", "catalogue" -> { handleSearch(cmd); yield true; }
                 case "item" -> { handleItem(cmd); yield true; }
+                case "copy" -> { handleCopy(cmd); yield true; }
                 case "member" -> { handleMember(cmd); yield true; }
                 case "borrow" -> { handleBorrow(cmd); yield true; }
                 case "return" -> { handleReturn(cmd); yield true; }
                 case "renew" -> { handleRenew(cmd); yield true; }
                 case "lost" -> { handleLost(cmd); yield true; }
                 case "reserve" -> { handleReserve(cmd); yield true; }
-                case "cancel" -> { handleCancelReservation(cmd); yield true; }
+                case "cancel", "unreserve" -> { handleCancelReservation(cmd); yield true; }
+                case "collect" -> { handleCollectReservation(cmd); yield true; }
                 case "fine", "fines" -> { handleFines(cmd); yield true; }
                 case "my" -> { handleMy(cmd); yield true; }
                 case "inbox" -> { handleInbox(); yield true; }
@@ -146,7 +160,7 @@ public class ConsoleUI {
                     yield true;
                 }
             };
-        } catch (LibraryException | IllegalArgumentException e) {
+        } catch (LibraryException | IllegalArgumentException | IllegalStateException e) {
             out.println("Error: " + e.getMessage());
             return true;
         }
@@ -161,7 +175,7 @@ public class ConsoleUI {
         out.printf("Welcome, %s (%s - %s).%n", user.getName(), user.getUserId(), user.getRole());
 
         if (user instanceof Member member) {
-            List<Notification> unread = ctx.notifications().findUnreadByMemberId(member.getUserId());
+            List<Notification> unread = notificationService.getUnreadForMember(member.getUserId());
             if (!unread.isEmpty()) {
                 out.printf("You have %d unread notification(s):%n", unread.size());
                 for (Notification n : unread) {
@@ -195,21 +209,15 @@ public class ConsoleUI {
     }
 
     private void handleSearch(ParsedCommand cmd) {
-        String query = cmd.args().isEmpty() ? "" : String.join(" ", cmd.args());
-        if (catalogueService != null) {
-            printItems(catalogueService.search(query, null, false));
-            return;
-        }
-        String q = query.toLowerCase(Locale.ROOT);
-        List<Item> matches = ctx.items().findAll().stream()
-                .filter(i -> !i.isRetired())
-                .filter(i -> q.isEmpty()
-                        || i.getItemId().toLowerCase(Locale.ROOT).contains(q)
-                        || (i.getTitle() != null && i.getTitle().toLowerCase(Locale.ROOT).contains(q))
-                        || (i.getCategory() != null && i.getCategory().toLowerCase(Locale.ROOT).contains(q))
-                        || (i.getAuthor() != null && i.getAuthor().toLowerCase(Locale.ROOT).contains(q)))
-                .toList();
-        printItems(matches);
+        ParsedArguments parsed = parseArguments(cmd.args());
+        ItemType type = parsed.options().containsKey("type")
+                ? ItemType.valueOf(parsed.options().get("type").toUpperCase(Locale.ROOT).replace(' ', '_'))
+                : null;
+        boolean availableOnly = parsed.options().containsKey("available");
+        String query = String.join(" ", parsed.positionals());
+        requireService(catalogueService, "CatalogueService");
+        printItems(catalogueService.search(query,
+                parsed.options().get("author"), parsed.options().get("category"), type, availableOnly));
     }
 
     private void printItems(List<Item> items) {
@@ -234,25 +242,57 @@ public class ConsoleUI {
         authService.requireLibrarian();
         String sub = cmd.subcommand();
         switch (sub) {
+            case "add" -> {
+                if (cmd.args().size() < 3) {
+                    out.println("Usage: item add <type> \"<title>\" [--category=..] [--author=..] [--isbn=..] [--copies=1]");
+                    return;
+                }
+                ParsedArguments parsed = parseArguments(cmd.args().subList(1, cmd.args().size()));
+                if (parsed.positionals().size() < 2) {
+                    out.println("Usage: item add <type> \"<title>\" [options]");
+                    return;
+                }
+                String type = parsed.positionals().get(0);
+                String title = String.join(" ", parsed.positionals().subList(1, parsed.positionals().size()));
+                Map<String, String> options = parsed.options();
+                int year = parseIntOption(options, "year", LocalDate.now(clock).getYear());
+                int copies = parseIntOption(options, "copies", 1);
+                Item item = new ItemFactory().createItem(
+                        type, ids.next(IdGenerator.Kind.ITEM), title,
+                        options.getOrDefault("category", "Uncategorized"), year, copies,
+                        options.getOrDefault("isbn", ""), options.getOrDefault("author", ""),
+                        options.getOrDefault("publisher", ""), parseIntOption(options, "pages", 0),
+                        parseIntOption(options, "issue", 0), options.getOrDefault("month", ""),
+                        options.getOrDefault("director", ""), parseIntOption(options, "runtime", 0));
+                requireService(catalogueService, "CatalogueService");
+                catalogueService.addItem(item);
+                out.println("Added " + item.getType() + " " + item.getItemId() + " (" + item.getTitle() + ").");
+            }
             case "retire" -> {
                 String itemId = cmd.arg(1);
                 if (itemId.isEmpty()) {
                     out.println("Usage: item retire <itemId>");
                     return;
                 }
-                if (catalogueService != null) {
-                    catalogueService.retireItem(itemId);
-                } else {
-                    Item item = ctx.items().findById(itemId)
-                            .orElseThrow(() -> new IllegalArgumentException("Item not found: " + itemId));
-                    item.retire();
-                    ctx.items().save(item);
-                }
+                requireService(catalogueService, "CatalogueService");
+                catalogueService.retireItem(itemId);
                 out.println("Item " + itemId + " retired.");
+            }
+            case "edit" -> {
+                if (cmd.args().size() < 2) {
+                    out.println("Usage: item edit <itemId> [--title=..] [--category=..] [--year=..]");
+                    return;
+                }
+                Map<String, String> options = parseArguments(cmd.args().subList(2, cmd.args().size())).options();
+                requireService(catalogueService, "CatalogueService");
+                catalogueService.updateItem(cmd.arg(1), options.get("title"), options.get("category"),
+                        options.containsKey("year") ? Integer.parseInt(options.get("year")) : null);
+                out.println("Item " + cmd.arg(1) + " updated.");
             }
             case "info" -> {
                 String itemId = cmd.arg(1);
-                Item item = ctx.items().findById(itemId)
+                requireService(catalogueService, "CatalogueService");
+                Item item = catalogueService.findById(itemId)
                         .orElseThrow(() -> new IllegalArgumentException("Item not found: " + itemId));
                 out.printf("%s | %s (%d) | Type: %s | Category: %s | Retired: %s | Copies: %d/%d available%n",
                         item.getItemId(), item.getTitle(), item.getPublicationYear(),
@@ -260,8 +300,19 @@ public class ConsoleUI {
                         item.countAvailable(), item.countActiveCopies());
                 item.getCopies().forEach(c -> out.printf("  Copy %s -> %s%n", c.getCopyId(), c.getStatus()));
             }
-            default -> out.println("Usage: item <info|retire> <itemId>");
+            default -> out.println("Usage: item <add|edit|info|retire> ...");
         }
+    }
+
+    private void handleCopy(ParsedCommand cmd) {
+        authService.requireLibrarian();
+        if (!"add".equals(cmd.subcommand()) || cmd.args().size() < 3) {
+            out.println("Usage: copy add <itemId> <count>");
+            return;
+        }
+        requireService(catalogueService, "CatalogueService");
+        catalogueService.addCopies(cmd.arg(1), Integer.parseInt(cmd.arg(2)));
+        out.println("Added " + cmd.arg(2) + " copy/copies to item " + cmd.arg(1) + ".");
     }
 
     private void handleMember(ParsedCommand cmd) {
@@ -336,10 +387,10 @@ public class ConsoleUI {
     }
 
     private void handleReturn(ParsedCommand cmd) {
-        authService.requireLibrarian();
+        User actor = authService.requireLoggedIn();
         if (cmd.args().isEmpty()) { out.println("Usage: return <copyId>"); return; }
         requireService(circulationService, "LoanService");
-        Loan loan = circulationService.returnCopy(cmd.arg(0));
+        Loan loan = circulationService.returnCopy(cmd.arg(0), actor.getUserId());
         out.printf("Copy %s returned (loan %s).%n", loan.getCopyId(), loan.getLoanId());
     }
 
@@ -353,10 +404,10 @@ public class ConsoleUI {
     }
 
     private void handleLost(ParsedCommand cmd) {
-        authService.requireLibrarian();
+        User actor = authService.requireLibrarian();
         if (cmd.args().isEmpty()) { out.println("Usage: lost <loanId>"); return; }
         requireService(circulationService, "LoanService");
-        Loan loan = circulationService.markLost(cmd.arg(0));
+        Loan loan = circulationService.markLost(cmd.arg(0), actor.getUserId());
         out.printf("Loan %s marked LOST.%n", loan.getLoanId());
     }
 
@@ -387,6 +438,18 @@ public class ConsoleUI {
         out.println("Reservation " + cmd.arg(0) + " cancelled.");
     }
 
+    private void handleCollectReservation(ParsedCommand cmd) {
+        Member member = authService.requireMember();
+        if (cmd.args().isEmpty()) {
+            out.println("Usage: collect <reservationId>");
+            return;
+        }
+        requireService(circulationService, "LoanService");
+        Loan loan = circulationService.collectReservation(cmd.arg(0), member.getUserId());
+        out.printf("Reservation collected; loan %s created for copy %s, due %s.%n",
+                loan.getLoanId(), loan.getCopyId(), loan.getDueDate());
+    }
+
     private void handleFines(ParsedCommand cmd) {
         User actor = authService.requireLoggedIn();
         if ("pay".equals(cmd.subcommand())) {
@@ -405,7 +468,8 @@ public class ConsoleUI {
             out.println("Usage: fines <memberId>  OR  fine pay <fineId> <amount>");
             return;
         }
-        List<Fine> list = ctx.fines().findByMemberId(memberId);
+        requireService(fineService, "FineService");
+        List<Fine> list = fineService.getMemberFines(memberId);
         if (list.isEmpty()) {
             out.println("No fines found for " + memberId + ".");
             return;
@@ -419,20 +483,27 @@ public class ConsoleUI {
         String sub = cmd.subcommand();
         switch (sub) {
             case "loans" -> {
-                List<Loan> active = ctx.loans().findActiveByMemberId(member.getUserId());
+                requireService(circulationService, "LoanService");
+                requireService(catalogueService, "CatalogueService");
+                List<Loan> active = circulationService.getMemberLoans(member.getUserId()).stream()
+                        .filter(Loan::isActive)
+                        .toList();
                 if (active.isEmpty()) {
                     out.println("You have no active loans.");
                     return;
                 }
                 for (Loan l : active) {
-                    String title = ctx.items().findById(l.getItemId()).map(Item::getTitle).orElse(l.getItemId());
+                    String title = catalogueService.findById(l.getItemId()).map(Item::getTitle).orElse(l.getItemId());
                     out.printf("%s | %s (%s) | Borrowed: %s | Due: %s | Renewals: %d%n",
                             l.getLoanId(), title, l.getCopyId(), l.getBorrowDate(), l.getDueDate(), l.getRenewalCount());
                 }
             }
             case "history" -> printMemberHistory(member.getUserId());
             case "reservations" -> {
-                List<Reservation> res = ctx.reservations().findActiveByMemberId(member.getUserId());
+                requireService(reservationService, "ReservationService");
+                List<Reservation> res = reservationService.getMemberReservations(member.getUserId()).stream()
+                        .filter(reservation -> reservation.getStatus().isActive())
+                        .toList();
                 if (res.isEmpty()) {
                     out.println("You have no active reservations.");
                     return;
@@ -441,7 +512,8 @@ public class ConsoleUI {
                         r.getReservationId(), r.getItemId(), r.getStatus(), r.getHoldExpiresOn()));
             }
             case "fines" -> {
-                List<Fine> fines = ctx.fines().findByMemberId(member.getUserId());
+                requireService(fineService, "FineService");
+                List<Fine> fines = fineService.getMemberFines(member.getUserId());
                 if (fines.isEmpty()) {
                     out.println("You have no fines.");
                     return;
@@ -455,7 +527,7 @@ public class ConsoleUI {
 
     private void handleInbox() {
         Member member = authService.requireMember();
-        List<Notification> messages = ctx.notifications().findByMemberId(member.getUserId());
+        List<Notification> messages = notificationService.getForMember(member.getUserId());
         if (messages.isEmpty()) {
             out.println("Your inbox is empty.");
             return;
@@ -464,8 +536,7 @@ public class ConsoleUI {
             String flag = n.isRead() ? "READ  " : "UNREAD";
             out.printf("[%s] %s (%s): %s%n", flag, n.getNotificationId(), n.getCreatedAt(), n.getMessage());
             if (!n.isRead()) {
-                n.markRead();
-                ctx.notifications().save(n);
+                notificationService.markRead(n.getNotificationId());
             }
         }
     }
@@ -480,18 +551,21 @@ public class ConsoleUI {
                     out.println("No overdue loans.");
                     return;
                 }
-                out.printf("%-8s %-8s %-20s %-30s %-12s %-6s%n",
-                        "LOAN", "MEMBER", "NAME", "ITEM", "DUE", "DAYS");
-                out.println("-".repeat(88));
+                out.printf("%-8s %-8s %-20s %-30s %-12s %-6s %-10s%n",
+                        "LOAN", "MEMBER", "NAME", "ITEM", "DUE", "DAYS", "FINE");
+                out.println("-".repeat(100));
                 for (OverdueEntry e : overdue) {
-                    out.printf("%-8s %-8s %-20s %-30s %-12s %-6d%n",
+                    out.printf("%-8s %-8s %-20s %-30s %-12s %-6d $%-9s%n",
                             e.loanId(), e.memberId(), truncate(e.memberName(), 19),
-                            truncate(e.itemTitle(), 29), e.dueDate(), e.daysOverdue());
+                            truncate(e.itemTitle(), 29), e.dueDate(), e.daysOverdue(), e.fineSoFar());
                 }
             }
             case "popular" -> {
-                int topN = cmd.args().size() >= 2 ? Integer.parseInt(cmd.arg(1)) : 10;
-                List<PopularItemEntry> popular = reportService.getPopularItems(topN);
+                ParsedArguments parsed = parseArguments(cmd.args().subList(1, cmd.args().size()));
+                int topN = parsed.positionals().isEmpty() ? 5 : Integer.parseInt(parsed.positionals().get(0));
+                LocalDate from = parseDateOption(parsed.options().get("from"));
+                LocalDate to = parseDateOption(parsed.options().get("to"));
+                List<PopularItemEntry> popular = reportService.getPopularItems(topN, from, to);
                 if (popular.isEmpty()) {
                     out.println("No loan data available yet.");
                     return;
@@ -529,7 +603,27 @@ public class ConsoleUI {
                     out.println("By Category:   " + cats);
                 }
             }
-            default -> out.println("Usage: report <overdue|popular [N]|member <memberId>|summary>");
+            case "unpaid" -> {
+                var entries = reportService.getMembersWithUnpaidFines();
+                if (entries.isEmpty()) {
+                    out.println("No unpaid fines.");
+                    return;
+                }
+                for (var entry : entries) {
+                    out.printf("%s | %s | Unpaid: $%s%n",
+                            entry.memberId(), entry.memberName(), entry.amount());
+                }
+            }
+            case "unused" -> {
+                List<Item> unused = reportService.getItemsNeverBorrowed();
+                if (unused.isEmpty()) {
+                    out.println("Every active item has been borrowed.");
+                    return;
+                }
+                unused.forEach(item -> out.printf("%s | %s | %s%n",
+                        item.getItemId(), item.getTitle(), item.getType()));
+            }
+            default -> out.println("Usage: report <overdue|popular [N] [--from=..] [--to=..]|unpaid|unused|member <memberId>|summary>");
         }
     }
 
@@ -557,6 +651,41 @@ public class ConsoleUI {
         }
     }
 
+    private static ParsedArguments parseArguments(List<String> arguments) {
+        List<String> positionals = new java.util.ArrayList<>();
+        Map<String, String> options = new java.util.LinkedHashMap<>();
+        for (int i = 0; i < arguments.size(); i++) {
+            String argument = arguments.get(i);
+            if (!argument.startsWith("--")) {
+                positionals.add(argument);
+                continue;
+            }
+            int equals = argument.indexOf('=');
+            String key = equals < 0 ? argument.substring(2) : argument.substring(2, equals);
+            String value;
+            if (equals >= 0) {
+                value = argument.substring(equals + 1);
+            } else if (i + 1 < arguments.size() && !arguments.get(i + 1).startsWith("--")) {
+                value = arguments.get(++i);
+            } else {
+                value = "true";
+            }
+            options.put(key.toLowerCase(Locale.ROOT), value);
+        }
+        return new ParsedArguments(List.copyOf(positionals), Map.copyOf(options));
+    }
+
+    private static int parseIntOption(Map<String, String> options, String key, int fallback) {
+        String value = options.get(key);
+        return value == null ? fallback : Integer.parseInt(value);
+    }
+
+    private static LocalDate parseDateOption(String value) {
+        return value == null || value.isBlank() ? null : LocalDate.parse(value);
+    }
+
+    private record ParsedArguments(List<String> positionals, Map<String, String> options) { }
+
     private static String truncate(String value, int max) {
         if (value == null) return "-";
         return value.length() <= max ? value : value.substring(0, max - 1) + "…";
@@ -567,37 +696,45 @@ public class ConsoleUI {
         out.println("  login <userId> <password>           Sign in as librarian or member");
         out.println("  logout                              Sign out of current session");
         out.println("  whoami                              Show current logged-in user");
-        out.println("  search [keyword]                    Search catalogue items");
+        out.println("  search [text] [--author=..] [--category=..] [--type=TYPE] [--available]");
         out.println("  help                                Show this help message");
         out.println("  exit                                Exit application");
 
         authService.getCurrentUser().ifPresent(u -> {
             if (u.getRole() == Role.LIBRARIAN) {
                 out.println("\nLibrarian Commands:");
+                out.println("  item add <type> \"<title>\" [options] Add a catalogue item");
                 out.println("  member add \"<Name>\" <TIER> [pwd]    Register new member (STUDENT|STAFF|SENIOR)");
                 out.println("  member list                         List all registered members");
                 out.println("  member suspend <memberId>           Suspend a member account");
                 out.println("  member activate <memberId>          Reactivate a suspended member");
                 out.println("  member unlock <userId>              Unlock a locked account");
                 out.println("  item info <itemId>                  View item details & copy statuses");
+                out.println("  item edit <itemId> [options]        Edit title, category or publication year");
                 out.println("  item retire <itemId>                Retire a catalogue item");
+                out.println("  copy add <itemId> <count>           Add physical copies");
                 out.println("  borrow <memberId> <itemId>          Issue a loan to a member");
                 out.println("  return <copyId>                     Process copy return");
                 out.println("  renew <loanId>                      Renew an active loan");
+                out.println("  return <copyId>                     Return a copy");
                 out.println("  lost <loanId>                       Mark an active loan as lost");
                 out.println("  reserve <memberId> <itemId>         Place reservation for a member");
                 out.println("  cancel <reservationId>              Cancel a reservation");
                 out.println("  fines <memberId>                    View member fines");
                 out.println("  fine pay <fineId> <amount>          Record fine payment");
                 out.println("  report overdue                      List all overdue loans");
-                out.println("  report popular [N]                  Top N most borrowed items");
+                out.println("  report popular [N] [--from=..] [--to=..]");
+                out.println("  report unpaid                       List members with unpaid fines");
+                out.println("  report unused                       List items never borrowed");
                 out.println("  report member <memberId>            Member borrowing history");
                 out.println("  report summary                      Collection & financial overview");
             } else {
                 out.println("\nMember Commands:");
                 out.println("  borrow <itemId>                     Borrow an available item");
+                out.println("  return <copyId>                     Return one of your copies");
                 out.println("  renew <loanId>                      Renew one of your active loans");
                 out.println("  reserve <itemId>                    Reserve an item");
+                out.println("  collect <reservationId>             Collect an item on hold");
                 out.println("  cancel <reservationId>              Cancel your reservation");
                 out.println("  my loans                            View your active loans");
                 out.println("  my history                          View your complete loan history");

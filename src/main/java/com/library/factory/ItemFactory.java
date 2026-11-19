@@ -3,6 +3,8 @@ package com.library.factory;
 
 import com.library.model.*;
 
+import java.util.Locale;
+
 public class ItemFactory {
 
     public Item createItem(
@@ -25,7 +27,7 @@ public class ItemFactory {
             throw new IllegalArgumentException("Item type is required.");
         }
 
-        switch (type.trim().toLowerCase()) {
+        switch (type.trim().toLowerCase(Locale.ROOT).replace('-', '_')) {
             case "book":
                 return new Book(id, title, category, year, copies,
                         isbn, author, publisher, pages);
@@ -39,6 +41,7 @@ public class ItemFactory {
                         director, runtimeMinutes);
 
             case "referencebook":
+            case "reference_book":
             case "reference book":
                 return new ReferenceBook(id, title, category, year, copies,
                         isbn, author, publisher, pages);
