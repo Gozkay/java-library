@@ -9,11 +9,22 @@ public enum CopyStatus {
 
     public boolean canMoveTo(CopyStatus next) {
         return switch (this) {
-            case AVAILABLE -> next == ON_LOAN || next == RETIRED;
-            case ON_LOAN   -> next == AVAILABLE || next == ON_HOLD || next == LOST;
-            case ON_HOLD   -> next == ON_LOAN || next == AVAILABLE || next == ON_HOLD || next == RETIRED;
-            case LOST      -> next == RETIRED;
-            case RETIRED   -> false;
+            case AVAILABLE -> next == ON_LOAN
+                    || next == ON_HOLD
+                    || next == RETIRED;
+
+            case ON_LOAN -> next == AVAILABLE
+                    || next == ON_HOLD
+                    || next == LOST;
+
+            case ON_HOLD -> next == ON_LOAN
+                    || next == AVAILABLE
+                    || next == ON_HOLD
+                    || next == RETIRED;
+
+            case LOST -> next == RETIRED;
+
+            case RETIRED -> false;
         };
     }
 }
